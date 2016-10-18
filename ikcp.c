@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdio.h>
 
 
 
@@ -250,6 +251,7 @@ ikcpcb* ikcp_create(IUINT32 conv, void *user)
 	kcp->probe = 0;
 	kcp->mtu = IKCP_MTU_DEF;
 	kcp->mss = kcp->mtu - IKCP_OVERHEAD;
+	kcp->stream = 0;
 
 	kcp->buffer = (char*)ikcp_malloc((kcp->mtu + IKCP_OVERHEAD) * 3);
 	if (kcp->buffer == NULL) {
@@ -337,6 +339,15 @@ void ikcp_release(ikcpcb *kcp)
 	}
 }
 
+
+//---------------------------------------------------------------------
+// set output callback, which will be invoked by kcp
+//---------------------------------------------------------------------
+void ikcp_setoutput(ikcpcb *kcp, int (*output)(const char *buf, int len,
+	ikcpcb *kcp, void *user))
+{
+	kcp->output = output;
+}
 
 
 //---------------------------------------------------------------------
@@ -461,6 +472,36 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 	assert(kcp->mss > 0);
 	if (len < 0) return -1;
 
+	// append to previous segment in streaming mode (if possible)
+	if (kcp->stream != 0) {
+		if (!iqueue_is_empty(&kcp->snd_queue)) {
+			IKCPSEG *old = iqueue_entry(kcp->snd_queue.prev, IKCPSEG, node);
+			if (old->len < kcp->mss) {
+				int capacity = kcp->mss - old->len;
+				int extend = (len < capacity)? len : capacity;
+				seg = ikcp_segment_new(kcp, old->len + extend);
+				assert(seg);
+				if (seg == NULL) {
+					return -2;
+				}
+				iqueue_add_tail(&seg->node, &kcp->snd_queue);
+				memcpy(seg->data, old->data, old->len);
+				if (buffer) {
+					memcpy(seg->data + old->len, buffer, extend);
+					buffer += extend;
+				}
+				seg->len = old->len + extend;
+				seg->frg = 0;
+				len -= extend;
+				iqueue_del_init(&old->node);
+				ikcp_segment_delete(kcp, old);
+			}
+		}
+		if (len <= 0) {
+			return 0;
+		}
+	}
+
 	if (len <= (int)kcp->mss) count = 1;
 	else count = (len + kcp->mss - 1) / kcp->mss;
 
@@ -480,7 +521,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 			memcpy(seg->data, buffer, size);
 		}
 		seg->len = size;
-		seg->frg = count - i - 1;
+		seg->frg = (kcp->stream == 0)? (count - i - 1) : 0;
 		iqueue_init(&seg->node);
 		iqueue_add_tail(&seg->node, &kcp->snd_queue);
 		kcp->nsnd_que++;
@@ -1219,6 +1260,15 @@ int ikcp_wndsize(ikcpcb *kcp, int sndwnd, int rcvwnd)
 int ikcp_waitsnd(const ikcpcb *kcp)
 {
 	return kcp->nsnd_buf + kcp->nsnd_que;
+}
+
+
+// read conv
+IUINT32 ikcp_getconv(const void *ptr)
+{
+	IUINT32 conv;
+	ikcp_decode32u((const char*)ptr, &conv);
+	return conv;
 }
 
 
